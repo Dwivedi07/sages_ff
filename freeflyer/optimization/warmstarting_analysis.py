@@ -1,24 +1,17 @@
 """
-This script will be perofrming pre-scp and post-scp analysis for both ART models for 
-purely new samples.
-pre-scp compares these three variants:
-    - Convex warmstarting (CVX)
-    - ART-ctg-text warmstarting (DT_ctg)
-    
-Criteria of comparison:
-    - Success rate of sematic obeying
-    - saftey: ctgs evalution for the warmstarted trajectories
+Pre-SCP / post-SCP warmstarting analysis on randomly sampled scenarios (aligned with
+dataset v02 / Lang_ctg training):
 
-Post SCP analysis compares the above three variants across these criterias:
+  - Init state: sample_init_target() (start region).
+  - Goal: random XY in one of 9 regions (x > 1.2 grid), behavior_mode = 9*time_id + region_id
+    with horizons k_T in {60, 80, 100}. No waypoint (matches current data generation).
+  - Text: master_file.json keys 0..26 × command_id.
 
-    post-scp compares these three variants:
-        - CVX(with added waypoint) - SCP(feasibility problem)
-        - ART-ctg-text warmstarting (DT_ctg) - SCP (feasibility problem)
-        - ART-ctg-text warmstarting (DT_ctg) - SCP (Fuel Optimality problem)
+Variants:
+  - CVX warmstart -> SCP feasibility (+ DT_ctg branches as below).
+  - ART (Lang_ctg) warmstart -> SCP feasibility / fuel-style run.
 
-    - Fuel consumtion: final const
-    - Number of iteration to converge
-    - Runtime to converge
+Metrics: feasibility, CTG at t=0, SCP iterations, runtime, costs.
 """
 import os
 import sys
@@ -38,17 +31,71 @@ from tqdm import tqdm
 
 # /src/
 import decision_transformer.manage as DT_manager
-from dynamics.freeflyer import FreeflyerModel, ocp_no_obstacle_avoidance, ocp_obstacle_avoidance, ocp_obstacle_avoidance_feasibility, compute_constraint_to_go, sample_init_target
+from dynamics.freeflyer import FreeflyerModel, ocp_no_obstacle_avoidance, ocp_obstacle_avoidance_feasibility_ST, compute_constraint_to_go, sample_init_target
 from optimization.ff_scenario import n_time_rpod, N_STATE, N_ACTION, obs, iter_max_SCP, robot_radius, safety_margin
 from decision_transformer.adapter import FrozenTextAdapter
-from dataset_generation.dataset_pargen import load_behavior_texts, get_behavior_text_batch, get_behavior_text, build_waypoint_for_obstacle, pick_terminal_index_and_wp_tidx, sample_case 
+from dataset_generation.dataset_pargen import (
+    load_behavior_texts,
+    get_behavior_text,
+    build_goal_regions_3x3_xgt12,
+    sample_goal_in_region,
+    sample_time_horizon_from_last_4_chunks,
+)
 
 device = DT_manager.device
 
-'''
-TODO:
-- (1) 
-'''
+
+def _pack_test_sample_for_random_scenario(
+    test_sample,
+    state_init,
+    state_final,
+    behavior_mode,
+    command_id,
+    data_stats,
+):
+    """
+    Build a batch matching torch_model_inference_dyn expectations for a fresh
+    (init, goal, behavior, command): normalized frozen init over the horizon, zero
+    actions/rtgs/ctgs at t=0 rollout start, goal tensor for compatibility.
+    """
+    states_i, actions_i, rtgs_i, ctgs_i, goal_i, timesteps_i, attention_mask_i, dt, time_sec, ix, _, _ = test_sample
+
+    sm = data_stats["states_mean"]
+    ss = data_stats["states_std"]
+    state_rep = torch.tensor(
+        np.repeat(state_init[None, :], n_time_rpod, axis=0), dtype=torch.float32
+    )
+    states_i[0, :, :] = (state_rep - sm) / (ss + 1e-6)
+    actions_i[0, :, :] = 0
+    rtgs_i[0, :, 0] = 0
+    # getix returns ctgs as (max_len, 1); rtgs/states are (1, max_len, …)
+    if ctgs_i.dim() == 2:
+        ctgs_i[:, 0] = 0
+    else:
+        ctgs_i[0, :, 0] = 0
+
+    g_mean = data_stats["goal_mean"]
+    g_std = data_stats["goal_std"]
+    if g_mean.dim() == 2:
+        g_mean, g_std = g_mean[0, :], g_std[0, :]
+    goal_norm = (torch.tensor(state_final, dtype=torch.float32) - g_mean) / (g_std + 1e-6)
+    goal_i[0, :, :] = goal_norm.unsqueeze(0).expand(goal_i.shape[1], -1)
+
+    return (
+        states_i,
+        actions_i,
+        rtgs_i,
+        ctgs_i,
+        goal_i,
+        timesteps_i,
+        attention_mask_i,
+        dt,
+        time_sec,
+        ix,
+        behavior_mode,
+        command_id,
+    )
+
 
 def pad_traj_to_full(states, actions_G, n_time_rpod):
     """
@@ -73,13 +120,14 @@ def for_computation(input_iterable):
     current_idx = input_iterable[0]
     input_dict = input_iterable[1]
     model_ctg = input_dict['model_ctg']
-    model_text = input_dict['model_text']
+    # model_text = input_dict['model_text']
     text_encoder_ctg = input_dict['text_encoder_ctg']
-    text_encoder_text = input_dict['text_encoder_text']
+    # text_encoder_text = input_dict['text_encoder_text']
     sample_init_final = input_dict['sample_init_final']
     command_mapping = input_dict['command_mapping']
     test_loader = input_dict['test_loader']
     unseen_text = input_dict['unseen_text']
+    regions = input_dict['regions']
     
 
     # Output dictionary initialization
@@ -135,45 +183,42 @@ def for_computation(input_iterable):
     seed = 7 + current_idx
     rng = np.random.default_rng(seed)
 
-    # TODO: can also use new json for test analysis
     if unseen_text:
-        c_id = np.random.randint(100,120) # a random text command in same sematics
+        c_id = int(rng.integers(100, 120))
     else:
-        c_id = np.random.randint(0,100) # a random text command in same sematics 
+        c_id = int(rng.integers(0, 100))
 
+    k_T = None
+    wp = None
     if sample_init_final:
-        # TODO: write propoer sampling function based snippet
-        state_init, state_final = sample_init_target()
-        # --- NEW: decide case / timing / waypoint ---
-        behavior_i, _ = sample_case(rng)
-        k_T, k_wp = pick_terminal_index_and_wp_tidx(behavior_i, rng)
+        state_init, _ = sample_init_target()
+        region_id = int(rng.integers(0, len(regions)))
+        _time_id, k_T = sample_time_horizon_from_last_4_chunks(rng)
+        behavior_i = 9 * int(_time_id) + region_id
+        goal_xy = sample_goal_in_region(rng, regions[region_id])
+        state_final = np.zeros(N_STATE, dtype=float)
+        state_final[0:2] = goal_xy
         wp = None
-        if behavior_i in {0, 1}:
-            wp = build_waypoint_for_obstacle(behavior_i)
-        elif behavior_i in {2, 3}:
-            wp = build_waypoint_for_obstacle(behavior_i)
-        if wp is not None and k_wp is not None:
-            wp['t_index'] = int(k_wp)
 
-        (states_i, actions_i, rtgs_i, ctgs_i, goal_i, timesteps_i, attention_mask_i, dt, time_sec, ix, behavior_i_t, command_id_i_t) = test_sample
-
-        test_sample[0][0,:,:] = (torch.tensor(np.repeat(state_init[None,:], n_time_rpod, axis=0)) - data_stats['states_mean'])/(data_stats['states_std'] + 1e-6)
-        test_sample[1][0,:,:] = torch.zeros((n_time_rpod, N_ACTION))
-        test_sample[2][0,:,0] = torch.zeros((n_time_rpod,))
-        test_sample[3][:,0] = torch.zeros((n_time_rpod,))
-        behavior_i_t      = behavior_i
-        command_id_i_t    = c_id
-        out['test_dataset_ix'] = test_sample[-3][0]
-        test_sample = (states_i, actions_i, rtgs_i, ctgs_i, goal_i, timesteps_i, attention_mask_i, dt, time_sec, ix, behavior_i_t, command_id_i_t)
+        test_sample = _pack_test_sample_for_random_scenario(
+            test_sample,
+            state_init,
+            state_final,
+            behavior_i,
+            c_id,
+            data_stats,
+        )
+        ix = test_sample[9]
+        out['test_dataset_ix'] = int(ix[0].item()) if torch.is_tensor(ix[0]) else int(ix[0])
     else:
         states_i, actions_i, rtgs_i, ctgs_i, goal_i, timesteps_i, attention_mask_i, dt, time_sec, ix, behavior_i, command_id_i = test_sample
-        out['test_dataset_ix'] = ix[0]
+        out['test_dataset_ix'] = int(ix[0].item()) if torch.is_tensor(ix[0]) else int(ix[0])
         state_init = np.array((states_i[0, 0, :] * data_stats['states_std'][0]) + data_stats['states_mean'][0])
         state_final = np.array((goal_i[0, 0, :] * data_stats['goal_std'][0]) + data_stats['goal_mean'][0])
 
 
-    out['behavior'] = behavior_i
-    out['command'] = get_behavior_text(command_mapping, behavior_i, c_id)
+    out['behavior'] = int(behavior_i) if not torch.is_tensor(behavior_i) else int(behavior_i.item())
+    out['command'] = get_behavior_text(command_mapping, out['behavior'], c_id)
 
     out['state_init'] = state_init
     out['state_final'] = state_final
@@ -217,8 +262,9 @@ def for_computation(input_iterable):
 
         # Solve SCP Feasibility Problem
         runtime0_scp_cvx = time.time()
-        traj_scp_cvx, J_vect_scp_cvx, iter_scp_cvx, feas_scp_cvx = ocp_obstacle_avoidance_feasibility(ff_model, states_ws_cvx, actions_ws_cvx, state_init, state_final) # feasibility problem
-        # traj_scp_cvx, J_vect_scp_cvx, iter_scp_cvx, feas_scp_cvx = ocp_obstacle_avoidance(ff_model, states_ws_cvx, actions_ws_cvx, state_init, state_final, n_time_override=k_T, waypoint=wp) # expert solution
+        traj_scp_cvx, J_vect_scp_cvx, iter_scp_cvx, feas_scp_cvx = ocp_obstacle_avoidance_feasibility_ST(
+            ff_model, states_ws_cvx, actions_ws_cvx, state_init, w_tracking=1.0
+        )
         runtime1_scp_cvx = time.time()
         runtime_scp_cvx = runtime1_scp_cvx - runtime0_scp_cvx
         
@@ -233,33 +279,6 @@ def for_computation(input_iterable):
             out['states_scp_cvx'] = states_scp_full
             out['actions_scp_cvx'] = actions_scp_full
 
-    ##################################################################
-    ####### Warmstart ART text only
-    ##################################################################
-    # DT_text_trajectory, runtime_DT_text = DT_manager.torch_model_inference_dyn(model_text, test_loader, test_sample, text_encoder_text, command_mapping, ctg_condition=False)                        
-    # out['J_DT_text'] = np.sum(la.norm(DT_text_trajectory['dv_dyn'], ord=1, axis=0))
-    # states_ws_DT_text = np.hstack((DT_text_trajectory['xypsi_dyn'], state_final.reshape(-1,1))) # set warm start
-    # actions_ws_DT_text = DT_text_trajectory['dv_dyn'] # set warm start
-    # # Save DT in the output dictionary
-    # out['runtime_DT_text'] = runtime_DT_text
-    # out['actions_ws_DT_text'] = actions_ws_DT_text
-    # out['states_ws_DT_text'] = states_ws_DT_text # clip the states to be of shape [6,100] not [6,101]
-
-    # # Solve SCP
-    # runtime0_scp_DT_text = time.time()
-    # traj_scp_DT_text, J_vect_scp_DT_text, iter_scp_DT_text, feas_scp_DT_text = ocp_obstacle_avoidance_feasibility(ff_model, states_ws_DT_text, actions_ws_DT_text, state_init, state_final)
-    # runtime1_scp_DT_text = time.time()
-    # runtime_scp_DT_text = runtime1_scp_DT_text - runtime0_scp_DT_text
-
-    # if np.char.equal(feas_scp_DT_text,'infeasible'):
-    #     out['feasible_DT_text'] = False
-    # else:
-    #     # Save scp_DT_text data in the output dictionary
-    #     out['J_vect_scp_DT_text'] = J_vect_scp_DT_text
-    #     out['iter_scp_DT_text'] = iter_scp_DT_text    
-    #     out['runtime_scp_DT_text'] = runtime_scp_DT_text
-    #     out['states_scp_DT_text'] = traj_scp_DT_text['states']
-    #     out['actions_scp_DT_text'] = traj_scp_DT_text['actions_G']
     
     ##################################################################
     ####### Warmstart ART ctg + text
@@ -282,7 +301,9 @@ def for_computation(input_iterable):
 
     # Solve SCP Feasibility Problem
     runtime0_scp_DT_ctg = time.time()
-    traj_scp_DT_ctg, J_vect_scp_DT_ctg, iter_scp_DT_ctg, feas_scp_DT_ctg = ocp_obstacle_avoidance_feasibility(ff_model, states_ws_DT_ctg, actions_ws_DT_ctg, state_init, state_final)
+    traj_scp_DT_ctg, J_vect_scp_DT_ctg, iter_scp_DT_ctg, feas_scp_DT_ctg = ocp_obstacle_avoidance_feasibility_ST(
+        ff_model, states_ws_DT_ctg, actions_ws_DT_ctg, state_init
+    )
     runtime1_scp_DT_ctg = time.time()
     runtime_scp_DT_ctg = runtime1_scp_DT_ctg - runtime0_scp_DT_ctg  
     if np.char.equal(feas_scp_DT_ctg,'infeasible'):
@@ -297,7 +318,9 @@ def for_computation(input_iterable):
     
     # Solve SCP Optimality Probem without Added Waypoint
     runtime0_scp_DT_ctg_op = time.time()
-    traj_scp_DT_ctg_op, J_vect_scp_DT_ctg_op, iter_scp_DT_ctg_op, feas_scp_DT_ctg_op = ocp_obstacle_avoidance_feasibility(ff_model, states_ws_DT_ctg, actions_ws_DT_ctg, state_init, state_final, w_tracking=0.0)
+    traj_scp_DT_ctg_op, J_vect_scp_DT_ctg_op, iter_scp_DT_ctg_op, feas_scp_DT_ctg_op = ocp_obstacle_avoidance_feasibility_ST(
+        ff_model, states_ws_DT_ctg, actions_ws_DT_ctg, state_init, w_tracking=0.0
+    )
     runtime1_scp_DT_ctg_op = time.time()
     runtime_scp_DT_ctg_op = runtime1_scp_DT_ctg_op - runtime0_scp_DT_ctg_op  
 
@@ -314,12 +337,12 @@ def for_computation(input_iterable):
     return out
 
 if __name__ == '__main__':
-    ws_version = 'v_06_80k_seen'  # warmstarting analysis version #'v_01_total_seen_fo'. #
-    model_version_ctg = 'v_06' # v_03 for SCP+CVX IL with ctg; v_06 trained on 80k for 2e6 steps; v_07 trained on 200k for 2e6 steps
-    model_version_text = 'v_04' # v_04 for SCP IL
-    dataset_version = 'v01'
-    num_processes = 4
-    N_data = 1000
+    ws_version = 'v_01_seen'  # warmstarting analysis version #'v_01_total_seen_fo'. #
+    model_version_ctg = 'v_03' 
+    # model_version_text = 'v_04' # v_04 for SCP IL
+    dataset_version = 'v02'
+    num_processes = 2
+    N_data = 1500
     unseen_text = False
 
     import_config = DT_manager.transformer_import_config(model_version_ctg)
@@ -334,30 +357,30 @@ if __name__ == '__main__':
 
     # Get both ART models
     model_ctg = DT_manager.get_DT_model(model_version_ctg, train_loader, eval_loader, ctg_condition = True)
-    model_text = DT_manager.get_DT_model(model_version_text, train_loader, eval_loader, ctg_condition = False)
+    # model_text = DT_manager.get_DT_model(model_version_text, train_loader, eval_loader, ctg_condition = False)
 
     # load the text encoders for each models (and its weight)  
     MODEL = os.getenv("FTA_MODEL", "distilbert-base-uncased")
     text_encoder_ctg = FrozenTextAdapter(model_name=MODEL, out_dim=model_ctg.hidden_size, output_mode="tokens").to(device).eval()
     text_encoder_ctg.load_adapter(root_folder / "decision_transformer" / "saved_files" / "checkpoints" / f"{model_version_ctg}" / "text_adapter.pth") 
 
-    text_encoder_text = FrozenTextAdapter(model_name=MODEL, out_dim=model_text.hidden_size, output_mode="tokens").to(device).eval()
-    text_encoder_text.load_adapter(root_folder / "decision_transformer" / "saved_files" / "checkpoints" / f"{model_version_text}" / "text_adapter.pth") 
+    # text_encoder_text = FrozenTextAdapter(model_name=MODEL, out_dim=model_text.hidden_size, output_mode="tokens").to(device).eval()
+    # text_encoder_text.load_adapter(root_folder / "decision_transformer" / "saved_files" / "checkpoints" / f"{model_version_text}" / "text_adapter.pth") 
     
     # load the command mapping (master file) 
-    command_mapping = load_behavior_texts(root_folder / "dataset" / "master_file_gen_me.json") # master_file_test has 100 +  30 unseen commands
+    command_mapping = load_behavior_texts(root_folder / "dataset" / "master_file.json") # master_file_test has 100 +  30 unseen commands
 
     # Parallel for inputs
     N_data_test = np.min([test_loader.dataset.n_data, N_data]) 
+    regions = build_goal_regions_3x3_xgt12()
     other_args = {
         'model_ctg' : model_ctg,
-        'model_text' : model_text,
         'text_encoder_ctg' : text_encoder_ctg,
-        'text_encoder_text' : text_encoder_text,
         'test_loader' : test_loader,
         'sample_init_final' : True,
         'command_mapping' : command_mapping,
         'unseen_text' : unseen_text,
+        'regions': regions,
     } 
 
     test_dataset_ix = np.empty(shape=(N_data_test, ), dtype=float)

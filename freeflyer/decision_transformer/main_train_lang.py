@@ -42,10 +42,10 @@ from dataset_generation.dataset_pargen import load_behavior_texts, get_behavior_
 
 @dataclass
 class TrainArgs:
-    model_name: str = "v_07" # v_03: ctg based model, v04: no cttg normal IL model, v_02: with new short text cmds, v_05: model trained on 80k samples data
-    dataset_name: str = "v01" # v01: new with cvx soln also having semantic info, v05: old without cvx slon haviing sematic info
+    model_name: str = "v_05" # v_03: ctg based model, v04: no cttg normal IL model, v_02: with new short text cmds, v_05: model trained on 80k samples data
+    dataset_name: str = "v02" # v01: new with cvx soln also having semantic info, v05: old without cvx slon haviing sematic info
     epochs: int = 1
-    max_steps: int = 2000000 
+    max_steps: int = 2500000 
     lr: float = 3e-5
     weight_decay: float = 0.0
     warmup_steps: int = 10
@@ -246,7 +246,6 @@ def evaluate(
                 states=states_i,
                 actions=actions_i,
                 constraints=ctgs_i,
-                goal=goal_i,
                 commands_emb=commands_emb_i,
                 timesteps=timesteps_i,
                 attention_mask=attention_mask_i,
@@ -379,7 +378,9 @@ def main(cli: Optional[TrainArgs] = None):
     # --------- Text encoder & commands ---------
     MODEL = os.getenv("FTA_MODEL", "distilbert-base-uncased")
     text_encoder = FrozenTextAdapter(model_name=MODEL, out_dim=args.hidden_size, output_mode="tokens").to(device).eval()
-    command_mapping = load_behavior_texts(root_folder / "dataset" / "master_file_gen_me.json") # master_file has 100
+    # master_file.json: keys "0".."26"; get_behavior_text_batch remaps keys via behavior_mode_to_text_key
+    # so language matches horizon (slow <-> long k_T). Old checkpoints: pass use_text_key_remap=False.
+    command_mapping = load_behavior_texts(root_folder / "dataset" / "master_file_new.json")
 
     # --------- Output & plotting ---------
     out_dir = (root_folder / args.out_dir).resolve()
@@ -432,7 +433,6 @@ def main(cli: Optional[TrainArgs] = None):
                         states=states_i,
                         actions=actions_i,
                         constraints=ctgs_i,
-                        goal=goal_i,
                         commands_emb=commands_emb_i,
                         timesteps=timesteps_i,
                         attention_mask=attention_mask_i,

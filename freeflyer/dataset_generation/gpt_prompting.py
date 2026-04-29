@@ -1,229 +1,199 @@
-
 import os
-from typing import Dict, List
-import random
-import time
+from typing import Dict, List, Optional
 import json
 from pathlib import Path
-from openai import OpenAI
-import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted  # rate limit exception
-# from dotenv import load_dotenv
-# load_dotenv()
 
-################################## HELPER VARS #################################
-CASE_NAMES = [
-    "left_fast",   # 0
-    "left_slow",   # 1
-    "right_fast",  # 2
-    "right_slow",  # 3
-    "direct_fast", # 4
-    "direct_slow"  # 5
+from openai import OpenAI
+
+# Optional: only needed if you add Gemini paths later
+# import google.generativeai as genai
+# from google.api_core.exceptions import ResourceExhausted
+
+#                  y ↑
+
+#          +----------------+----------------+----------------+
+#          |   region 6     |   region 7     |   region 8     |
+#          |   left_top     |   center_top   |   right_top    |
+#  high y  |                |                |                |
+#          +----------------+----------------+----------------+
+#          |   region 3     |   region 4     |   region 5     |
+#          |   left_mid     |   center_mid   |   right_mid    |
+#  mid y   |                |                |                |
+#          +----------------+----------------+----------------+
+#          |   region 0     |   region 1     |   region 2     |
+#          | left_bottom    | center_bottom  | right_bottom   |
+#  low y   |                |                |                |
+#          +----------------+----------------+----------------+
+
+#                 left x          center x         right x
+
+# --------------------- table space boundary at x = 1.2 --------------------> x
+
+N_BEHAVIOR_MODES = 27
+K_T_BY_TIME_ID = {0: 60, 1: 80, 2: 100}
+
+# 3×3 goal grid (row-major): machine id + short cardinal phrase for prompts only
+REGION_INFO = [
+    ("left_bottom", "lower-left", "low-y low-x"),
+    ("center_bottom", "bottom-center", "low-y center-x"),
+    ("right_bottom", "lower-right", "low-y high-x"),
+    ("left_mid", "middle-left", "mid-y low-x"),
+    ("center_mid", "center", "mid-y center-x"),
+    ("right_mid", "middle-right", "mid-y high-x"),
+    ("left_top", "upper-left", "high-y low-x"),
+    ("center_top", "top-center", "high-y center-x"),
+    ("right_top", "upper-right", "high-y high-x"),
 ]
 
-MODE_IS_FAST = {0: True, 1: False, 2: True, 3: False, 4: True, 5: False}
+# Second column of REGION_INFO — every generated command must name the goal with one of these
+GOAL_ZONE_PHRASES = tuple(z for _, z, _ in REGION_INFO)
 
-# New: per-mode metadata used by the annotator
-BEHAVIOR_META = {
-    0: dict(   # left_fast
-        label="left_fast",
-        canonical=(
-            "fast left-side bypass of the obstacle with tight but safe clearance to the KOZ"
-        ),
-        geom_hints=[
-            "sharp left-side arc", "rapid port-side bypass",
-            "compressed schedule around left body", "left-biased sprint"
-        ],
-    ),
-    1: dict(   # left_slow
-        label="left_slow",
-        canonical=(
-            "slow left-side approach that widens clearance and allows extended loiter near the goal"
-        ),
-        geom_hints=[
-            "broad left-side arc", "port-side drift pass",
-            "expanded left margin", "left-biased loiter"
-        ],
-    ),
-    2: dict(   # right_fast
-        label="right_fast",
-        canonical=(
-            "fast right-side bypass of the obstacle with tight but safe clearance to the KOZ"
-        ),
-        geom_hints=[
-            "sharp right-side arc", "rapid starboard bypass",
-            "compressed schedule around right body", "right-biased sprint"
-        ],
-    ),
-    3: dict(   # right_slow
-        label="right_slow",
-        canonical=(
-            "slow right-side approach that widens clearance and allows extended loiter near the goal"
-        ),
-        geom_hints=[
-            "broad right-side arc", "starboard drift pass",
-            "expanded right margin", "right-biased loiter"
-        ],
-    ),
-    4: dict(   # direct_fast
-        label="direct_fast",
-        canonical=(
-            "fast transit through the central corridor with aggressive but KOZ-compliant timing"
-        ),
-        geom_hints=[
-            "central corridor sprint", "tight straight-through channel",
-            "compressed median-lane run", "direct, time-critical traverse"
-        ],
-    ),
-    5: dict(   # direct_slow
-        label="direct_slow",
-        canonical=(
-            "slow, conservative central-corridor transit with generous time and lateral margin"
-        ),
-        geom_hints=[
-            "broad central corridor", "gentle straight-through channel",
-            "relaxed median-lane run", "direct but margin-heavy traverse"
-        ],
-    ),
+
+def goal_zone_phrase_for_mode(mode_id: int) -> str:
+    """Hyphenated goal-sector label for this behavior (region_id = mode_id % 9)."""
+    return REGION_INFO[int(mode_id) % 9][1]
+
+
+def text_names_goal_zone(text: str, zone_phrase: str) -> bool:
+    """True if sentence includes the zone phrase (hyphenated or with a space)."""
+    if not text or not zone_phrase:
+        return False
+    t = text.lower()
+    z = zone_phrase.lower()
+    return z in t or z.replace("-", " ") in t
+
+
+# UPDATED: Added moderate cadence and clearer distinctions
+TIME_HORIZON_INFO = {
+    0: ("short", "short horizon", "time-prioritized", "agile profile", "between 20-24s", "in 60 steps"),
+    1: ("mid", "mid horizon", "balanced timing", "moderate cadence", "within 24-32s", "in 80 steps"),
+    2: ("full", "full horizon", "margin-prioritized", "extended coast", "nearly 32-40s", "in 100 steps"),
 }
 
-############################## ANNOTATE FUNCTIONS ##############################
+def _speed_mode_for_behavior(mode_idx: int) -> str:
+    """Vocabulary bucket for prompts: short k_T → fast, mid → moderate, long → slow."""
+    time_id = mode_idx // 9
+    if time_id == 0:
+        return "fast"
+    if time_id == 1:
+        return "moderate"
+    return "slow"
+
+
+def _build_behavior_meta() -> Dict[int, dict]:
+    meta = {}
+    for bm in range(N_BEHAVIOR_MODES):
+        region_id = bm % 9
+        time_id = bm // 9
+        k_T = K_T_BY_TIME_ID[time_id]
+        short_r, zone_plain, _band_hint = REGION_INFO[region_id]
+        _, long_t, tempo_hint, cadence_hint, wall_time_hint, steps_hint = TIME_HORIZON_INFO[
+            time_id
+        ]
+        label = f"{short_r}_t{k_T}"
+        canonical = (
+            f"Reach a goal in the {zone_plain} goal zone with a {long_t} ({steps_hint}, "
+            f"{wall_time_hint}); KOZ-compliant trajectory ({tempo_hint})."
+        )
+        geom_hints = [zone_plain, _band_hint, tempo_hint, cadence_hint, wall_time_hint, steps_hint]
+        meta[bm] = dict(label=label, canonical=canonical, geom_hints=geom_hints, k_T=k_T)
+    return meta
+
+BEHAVIOR_META = _build_behavior_meta()
 
 def annotate_traj_behaviors_gpt(
     ids: List[int],
     api_key: str,
-    model: str = "gpt-4o-mini",
-    max_tokens: int = 30,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
-    presence_penalty: float = 0.3,
-    frequency_penalty: float = 0.2,
-    speed_mode: str | None = None,   # still used, but now consistent with mode
+    model: str = "gpt-4o",
+    speed_mode: str = "moderate",
+    *,
+    max_tokens: int = 128,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> Dict[int, Dict[str, str]]:
-
-    # NOTE: ids are now in {0,1,2,3,4,5} matching CASE_NAMES / BEHAVIOR_META
-    voices = ["active voice", "passive voice"]
-
-    base_tones = [
-        "proximity-operations tone",
-        "navigation-performance tone",
-        "safety-justification tone",
-        "design-insight tone",
-        "line-of-sight preservation tone",
-    ]
-    fast_tones = base_tones + [
-        "time-optimality tone",
-        "agile-maneuvering tone",
-        "high pulse-cadence tone",
-    ]
-    slow_tones = base_tones + [
-        "conservative-velocity tone",
-        "risk-averse tone",
-        "low-thrust economy tone",
-        "extended coast-phase tone",
-    ]
-
-    structures = [
-        "state goal before path",
-        "start with a verb phrase",
-        "start with a noun phrase",
-        "start with a subordinate clause",
-        "use a nominalization once",
-        "use a gerund once",
-        "use a concise cause-effect clause",
-        "state clearance before geometry",
-    ]
-
-
-    forbidden = [
-        "exhibits", "employs", "circumferential", "designed to", "effectively",
-        "maintaining", "linear path", "negligible lateral", "restricted lateral",
-        "navigational integrity", "navigate", "path to the right", "path to the left",
-    ]
-
-    # Speed-specific vocabulary hints
+    # UPDATED: Mode-specific vocabulary hints
     speed_hints = {
-        "fast": [
-            "at elevated speed", "rapid transit",
-            "time-prioritized routing", "high-velocity pass", "agile profile",  "agile maneuver"
-        ],
-        "slow": [
-            "at reduced speed", "cautious velocity",
-            "margin-prioritized routing", "low-velocity pass", "conservative profile", "sluggish maneuver"
-        ],
-        None: [],
+        "fast": ["agile", "brisk", "quick", "snappy", "rapid", "swift",  "between 20-24s", "in 60 steps"],
+        "moderate": ["steady", "moderate", "deliberate", "balanced", "intermediate", "within 24-32s", "in 80 steps"],
+        "slow": ["sluggish", "slow", "gradual", "leisurely", "crawling", "measured", "nearly 32-40s", "in 100 steps"],
     }
+
+    speed_clause = {
+        "fast": "FAST MODE: Target ~20-24s. Use words like 'agile' or 'rapid'.",
+        "moderate": "MODERATE MODE: Target ~24-32s. Use words like 'steady' or 'balanced'.",
+        "slow": "SLOW MODE: Target ~32-40s. Use words like 'sluggish' or 'gradual'.",
+    }[speed_mode]
 
     client = OpenAI(api_key=api_key)
     out: Dict[int, Dict[str, str]] = {}
 
+    zone_catalog = ", ".join(f'"{p}"' for p in GOAL_ZONE_PHRASES)
     system_msg = (
-        "You are an expert GNC technical writer for proximity operations on a microgravity bench. "
-        "Produce ONE sentence per input describing a goal-directed trajectory with KOZ compliance and left/right/central corridor behavior. "
-        "Be concise (≤15 words), precise, and varied in style. Avoid jargon bloat."
+        "You are an expert GNC writer. Generate a single technical sentence for a robot trajectory.\n"
+        f"Goal location vocabulary (exact hyphenated phrases only): {zone_catalog}.\n"
+        "Every sentence MUST include the REQUIRED goal-zone phrase given in the user message, verbatim "
+        "(same spelling and hyphens).\n"
+        "Speed rule: use EITHER a speed adjective OR a time/horizon hint, not both in the same sentence."
     )
-
-    chosen_tones = (
-        fast_tones if speed_mode == "fast"
-        else slow_tones if speed_mode == "slow"
-        else base_tones
-    )
-
-    speed_clause = {
-        "fast": "Bias toward quicker transits and higher RCS pulse cadence.",
-        "slow": "Bias toward longer coasts, low Δv expenditure, and wider safety margins.",
-        None:   "No specific speed bias; emphasize KOZ compliance and stable standoff.",
-    }[speed_mode]
 
     for i, mode_id in enumerate(ids):
         meta = BEHAVIOR_META[mode_id]
-        beh_text = meta["canonical"]
-        geom_hints = "; ".join(meta["geom_hints"])
-        spd_hints = "; ".join(speed_hints.get(speed_mode, []))
+        hints = ", ".join(speed_hints[speed_mode])
+        zone_required = goal_zone_phrase_for_mode(mode_id)
 
-        style_voice = random.choice(voices)
-        style_tone = random.choice(chosen_tones)
-        style_structure = random.choice(structures)
-        do_not_use = ", ".join(forbidden)
-
-        user_msg = (
-            f"Behavior description: {beh_text}\n"
-            "Task: Produce ONE sentence that characterizes this specific trajectory mode on a microgravity bench "
-            "(path geometry, avoidance strategy, corridor usage, and implied tempo).\n"
-            f"Speed context: {speed_clause}\n"
-            f"Style controls: Use {style_voice}; {style_tone}; {style_structure}. "
-            "Prefer precise proximity-ops phrasing (KOZ, standoff, LOS, Δv, RCS). "
-            "Avoid reusing long phrases from the behavior description.\n"
-            f"Strict constraints: ≤15 words; neutral, technically precise; no bullet points; no quotes; "
-            f"avoid these terms: {do_not_use}.\n"
-            f"Vocabulary hints (optional, but keep them mode-specific): {geom_hints}; {spd_hints}\n"
+        base_user = (
+            f"REQUIRED goal-sector phrase (must appear in your sentence): \"{zone_required}\".\n"
+            f"Context: {meta['canonical']}\n"
+            f"Speed Guidance: {speed_clause}\n"
+            f"Allowed adjectives for this mode: {hints}\n"
+            "If you use a time estimate or horizon length, omit the speed adjective; if you use a speed "
+            "adjective, omit time/horizon numbers.\n"
+            "Format: ONE sentence, ≤18 words, technical tone (KOZ, standoff, or RCS where natural)."
         )
 
-        try:
-            rsp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_msg},
-                ],
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
+        desc = ""
+        for attempt in range(5):
+            retry_note = (
+                ""
+                if attempt == 0
+                else f"\n\nRetry {attempt}: Previous text did not contain \"{zone_required}\". "
+                f'Output ONE new sentence that MUST include exactly "{zone_required}".'
             )
-            desc = (rsp.choices[0].message.content or "").strip()
-        except Exception as e:
-            desc = f"ERROR: {e.__class__.__name__}"
+            user_msg = base_user + retry_note
+            try:
+                rsp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    top_p=top_p,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                )
+                raw = rsp.choices[0].message.content
+                desc = (raw or "").strip()
+                if text_names_goal_zone(desc, zone_required):
+                    break
+            except Exception as e:
+                desc = f"Error in generation: {e}"
 
-        out[i] = {
-            "id": mode_id,
-            "behavior": meta["label"],
-            "description": desc,
-        }
+        if not text_names_goal_zone(desc, zone_required) and not str(desc).startswith("Error in generation"):
+            desc = f"KOZ-safe transit into the {zone_required} goal zone with controlled thrust."
 
+        out[i] = {"id": mode_id, "behavior": meta["label"], "description": desc}
     return out
 
+################################## HELPER VARS #################################
+# 27 behavior modes: behavior_mode = 9 * time_id + region_id
+#   region_id 0..8: 3×3 grid (row-major) for x > 1.2
+#   time_id 0..2:   k_T = 60, 80, 100
+
+############################## ANNOTATE FUNCTIONS ##############################
 # ======================================================
 #  HELPER FUNCTIONS
 # ======================================================
@@ -252,13 +222,22 @@ def generate_100_prompts_for_mode(
     target_n: int = 100,
 ) -> List[str]:
     """
-    mode_idx in {0..5}, matching CASE_NAMES / BEHAVIOR_META.
+    mode_idx in {0..26}, matching BEHAVIOR_META (9 regions × 3 time horizons).
     """
-    speed_mode = "fast" if MODE_IS_FAST[mode_idx] else "slow"
+    speed_mode = _speed_mode_for_behavior(mode_idx)
+    zone_fixed = goal_zone_phrase_for_mode(mode_idx)
 
     prompts: List[str] = []
     seen = set()
     sched = _diversity_schedules(target_n)
+
+    def _keep(txt: str) -> bool:
+        t = txt.strip()
+        if not t or t in seen:
+            return False
+        if t.startswith("Error in generation"):
+            return False
+        return text_names_goal_zone(t, zone_fixed)
 
     for block in sched:
         runs = block["runs"]
@@ -276,12 +255,14 @@ def generate_100_prompts_for_mode(
 
         for k in sorted(result.keys()):
             txt = result[k]["description"].strip()
-            if txt and txt not in seen:
+            if _keep(txt):
                 seen.add(txt)
                 prompts.append(txt)
 
-    # top-up loop as before
-    while len(prompts) < target_n:
+    # top-up loop (bounded — strict goal-zone filter may need many rounds)
+    topup_round = 0
+    while len(prompts) < target_n and topup_round < 2000:
+        topup_round += 1
         top = annotate_traj_behaviors_gpt(
             ids=[mode_idx] * 10,
             api_key=api_key,
@@ -295,7 +276,7 @@ def generate_100_prompts_for_mode(
         )
         for k in sorted(top.keys()):
             txt = top[k]["description"].strip()
-            if txt and txt not in seen:
+            if _keep(txt):
                 seen.add(txt)
                 prompts.append(txt)
             if len(prompts) >= target_n:
@@ -306,21 +287,41 @@ def generate_100_prompts_for_mode(
 
 def write_master_json(
     api_key: str,
-    out_path: str = None,
-    model_name: str = None,
+    out_path: Optional[str] = "master_file_gen.json",
+    model_name: str = "gpt-4o",
     n_per_mode: int = 100,
+    resume: bool = True,
 ) -> dict:
     """
-    Generates n_per_mode prompts for each behavior mode (0..5)
+    Generates n_per_mode prompts for each behavior mode (0..26)
     and writes a single nested JSON file with structure:
-      { "0": [ {"command_id":0,"text":"..."}, ... ], ..., "5": [ ... ] }
+      { "0": [ {"command_id":0,"text":"..."}, ... ], ..., "26": [ ... ] }
+
+    Writes to disk after each mode so that if the script fails, all modes
+    generated so far are already saved. If resume=True and the output file
+    exists, skips modes that are already present in the file.
     """
-    master = {}
     script_dir = Path(__file__).resolve().parent
     dataset_dir = script_dir.parent / "dataset"
-    dataset_dir.mkdir(exist_ok=True)  
+    dataset_dir.mkdir(exist_ok=True)
+    out_file = dataset_dir / Path(out_path or "master_file_gen.json").name
 
-    for mode_idx in range(6):
+    # Load existing data so we can resume and so we write incrementally
+    master = {}
+    if resume and out_file.exists():
+        try:
+            with open(out_file, "r", encoding="utf-8") as f:
+                master = json.load(f)
+            print(f" Resumed: loaded {len(master)} mode(s) from {out_file.name}")
+        except (json.JSONDecodeError, IOError) as e:
+            print(f" Could not load existing file ({e}); starting fresh.")
+
+    for mode_idx in range(N_BEHAVIOR_MODES):
+        key = str(mode_idx)
+        if resume and key in master and len(master[key]) >= n_per_mode:
+            print(f" Mode {mode_idx}: Skipped (already have {len(master[key])} prompts).")
+            continue
+
         prompts = generate_100_prompts_for_mode(
             mode_idx=mode_idx,
             api_key=api_key,
@@ -328,15 +329,13 @@ def write_master_json(
             target_n=n_per_mode,
         )
 
-        # Build list of dicts for this mode
         mode_entries = [{"command_id": i, "text": txt} for i, txt in enumerate(prompts)]
-        master[str(mode_idx)] = mode_entries
+        master[key] = mode_entries
         print(f" Mode {mode_idx}: Generated {len(prompts)} unique prompts.")
-    
-    out_path = dataset_dir / Path(out_path).name
-    # Write as a single JSON file
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(master, f, indent=2, ensure_ascii=False)
+
+        # Write immediately after each mode so failures don't lose data
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(master, f, indent=2, ensure_ascii=False)
 
     return master
 
@@ -347,17 +346,19 @@ if __name__ == "__main__":
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "<YOUR_API_KEY>")
     # GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "<YOUR_API_KEY>")
 
-    n_per_mode = 120
+    n_per_mode = 100
     # model_name = "gemini-2.0-flash"
-    model_name = "gpt-4o" # gpt model
+    model_name = "gpt-4o"  # gpt model
 
-    print("Generating 100 prompts for each of 6 behavior modes...")
+    out_name = "master_file_gen_me33.json"
+    print(f"Generating {n_per_mode} prompts for each of {N_BEHAVIOR_MODES} behavior modes...")
     master_data = write_master_json(
-        api_key=OPENAI_API_KEY, # GEMINI_API_KEY
-        out_path="master_file_gen_me.json",
+        api_key=OPENAI_API_KEY,
+        out_path=out_name,
         model_name=model_name,
         n_per_mode=n_per_mode,
     )
 
     total_prompts = sum(len(v) for v in master_data.values())
-    print(f"Wrote {total_prompts} prompts to dataset/master_file.json")
+    out_path = Path(__file__).resolve().parent.parent / "dataset" / out_name
+    print(f"Wrote {total_prompts} total prompts to {out_path}")

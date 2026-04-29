@@ -554,7 +554,7 @@ class AutonomousFreeflyerTransformer_Lang(DecisionTransformerPreTrainedModel):
 class AutonomousFreeflyerTransformer_Lang_ctg(DecisionTransformerPreTrainedModel):
     """
 
-    Language driven ART model. Having a sequence of [text, state, action] tokens.
+    Language driven ART model. Having a sequence of [text, constraint, state, action] tokens (no goal).
     The model builds upon the GPT2 architecture to perform autoregressive prediction of actions in an offline RL
     setting. Refer to the paper for more details: https://arxiv.org/abs/2106.01345
 
@@ -569,7 +569,6 @@ class AutonomousFreeflyerTransformer_Lang_ctg(DecisionTransformerPreTrainedModel
         self.encoder = DecisionTransformerGPT2Model(config)
 
         self.embed_timestep = nn.Embedding(config.max_ep_len, config.hidden_size)
-        self.embed_goal = torch.nn.Linear(config.state_dim, config.hidden_size)
         # self.embed_command = FrozenTextAdapter(model_name=MODEL, out_dim=hidden_size, output_mode="tokens").to(device).eval()
         self.embed_state = torch.nn.Linear(config.state_dim, config.hidden_size)
         self.embed_action = torch.nn.Linear(config.act_dim, config.hidden_size)
@@ -593,7 +592,6 @@ class AutonomousFreeflyerTransformer_Lang_ctg(DecisionTransformerPreTrainedModel
         states: Optional[torch.FloatTensor] = None,
         actions: Optional[torch.FloatTensor] = None,
         constraints: Optional[torch.FloatTensor] = None,
-        goal: Optional[torch.FloatTensor] = None,
         commands_emb: Optional[torch.FloatTensor] = None,
         timesteps: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
@@ -652,11 +650,10 @@ class AutonomousFreeflyerTransformer_Lang_ctg(DecisionTransformerPreTrainedModel
             # attention mask for GPT: 1 if can be attended to, 0 if not
             attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long)
 
-        # embed each modality with a different head
+        # embed each modality with a different head (no goal: constraint, state, action only)
         state_embeddings = self.embed_state(states)            # [B, T, H]
         action_embeddings = self.embed_action(actions)
         constraint_embeddings = self.embed_constraint(constraints)  # [B, T, H]
-        goal_embeddings = self.embed_goal(goal)
         command_embeddings = commands_emb                     # [B, M, H] expected
         time_embeddings = self.embed_timestep(timesteps)      #  [B, T, H]
 
@@ -668,25 +665,24 @@ class AutonomousFreeflyerTransformer_Lang_ctg(DecisionTransformerPreTrainedModel
         state_embeddings = state_embeddings + time_embeddings
         action_embeddings = action_embeddings + time_embeddings
         constraint_embeddings = constraint_embeddings + time_embeddings
-        goal_embeddings = goal_embeddings + time_embeddings
 
-        # interleave (g_1, c_1, s_1, a_1, g_2, c_2, s_2, a_2, ...)  -> [B, 4*T, H]
+        # interleave (c_1, s_1, a_1, c_2, s_2, a_2, ...)  -> [B, 3*T, H]
         traj_embeddings = (
-            torch.stack((goal_embeddings, constraint_embeddings, state_embeddings, action_embeddings), dim=1)
+            torch.stack((constraint_embeddings, state_embeddings, action_embeddings), dim=1)
             .permute(0, 2, 1, 3)
-            .reshape(batch_size, 4 * seq_length, self.hidden_size)
+            .reshape(batch_size, 3 * seq_length, self.hidden_size)
         )
 
-        # prepend command tokens: [B, M + 4*T, H]
+        # prepend command tokens: [B, M + 3*T, H]
         stacked_inputs = torch.cat([command_embeddings, traj_embeddings], dim=1)
         stacked_inputs = self.embed_ln(stacked_inputs)
 
-        # attention mask: ones for commands + repeated mask for (s,a)
+        # attention mask: ones for commands + repeated mask for (ctg, state, action)
         command_mask = torch.ones((batch_size, command_embeddings.shape[1]), dtype=torch.long, device=states.device)
         traj_mask = (
-            torch.stack((attention_mask, attention_mask, attention_mask, attention_mask), dim=1)
+            torch.stack((attention_mask, attention_mask, attention_mask), dim=1)
             .permute(0, 2, 1)
-            .reshape(batch_size, 4 * seq_length)
+            .reshape(batch_size, 3 * seq_length)
         )
         stacked_attention_mask = torch.cat([command_mask, traj_mask], dim=1)
 
@@ -702,19 +698,19 @@ class AutonomousFreeflyerTransformer_Lang_ctg(DecisionTransformerPreTrainedModel
             return_dict=return_dict,
         )
 
-        x = encoder_outputs[0]  # [B, M + 4T, H]
+        x = encoder_outputs[0]  # [B, M + 3T, H]
 
         # Drop command tokens first (M = #command tokens)
         M = command_embeddings.shape[1]                      # scalar
-        x_traj = x[:, M:, :]                                 # [B, 4T, H]
+        x_traj = x[:, M:, :]                                 # [B, 3T, H]
 
-        # Now reshape 4T back to (4, T) with stream order: (goal, ctg, state, action)
-        x_traj = x_traj.reshape(batch_size, seq_length, 4, self.hidden_size).permute(0, 2, 1, 3)      # [B, 4, T, H]            
+        # Now reshape 3T back to (3, T) with stream order: (ctg, state, action)
+        x_traj = x_traj.reshape(batch_size, seq_length, 3, self.hidden_size).permute(0, 2, 1, 3)      # [B, 3, T, H]            
     
 
         # get predictions
-        state_preds  = self.predict_state(x_traj[:, 3])   # predict next state from action stream (if used)
-        action_preds = self.predict_action(x_traj[:, 2])  # predict next action from state stream
+        state_preds  = self.predict_state(x_traj[:, 2])   # predict next state from action stream (if used)
+        action_preds = self.predict_action(x_traj[:, 1])  # predict next action from state stream
 
         if not return_dict:
             return (state_preds, action_preds)

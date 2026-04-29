@@ -110,10 +110,8 @@ class RpodDatasetLang(Dataset):
 def transformer_import_config(model_name):
     config = {}
     config['model_name'] = model_name
-    if model_name == 'v_03' or 'v_05':
-        config['ctg_condition'] = True # False for SCP only, True for SCP + CVX
-    if model_name == 'v_04':
-        config['ctg_condition'] = False
+    config['ctg_condition'] = True # False for SCP only, True for SCP + CVX
+    print("CTG condition set to: ", config['ctg_condition'])
     config['timestep_norm'] = False
     config['dataset_to_use'] = 'both' # 'scp', 'cvx', 'both'
     
@@ -231,7 +229,8 @@ def get_train_val_test_data(ctg_condition=True,
     
     return datasets, dataloaders
 
-def import_dataset(ctg_condition, dataset_to_use, dataset_version = 'v05', max_samples = None):
+def import_dataset(ctg_condition, dataset_to_use, dataset_version="v05", max_samples=None):
+    """Load torch + param data. For 27-mode datasets use dataset_version='v02'; param npz has 'behavior_mode'."""
     # Load the data
     data_dir = str(root_folder) + '/dataset'
     data_dir_torch = str(root_folder) + f'/dataset/torch/{dataset_version}'
@@ -243,7 +242,10 @@ def import_dataset(ctg_condition, dataset_to_use, dataset_version = 'v05', max_s
     rtgs_scp = torch.load(data_dir_torch + '/torch_rtgs_scp.pth')
     ctgs_cvx = torch.load(data_dir_torch + '/torch_ctgs_cvx.pth')
     ctgs_scp = torch.load(data_dir_torch + '/torch_ctgs_scp.pth')
-    data_param = np.load(data_dir + f'/dataset-ff-{dataset_version}-param.npz', allow_pickle=True)
+    raw_npz = np.load(data_dir + f'/dataset-ff-{dataset_version}-param.npz', allow_pickle=True)
+    # Support both old (6-mode, key 'behavior') and new (27-mode, key 'behavior_mode') param files
+    behavior_arr = raw_npz['behavior_mode'] if 'behavior_mode' in raw_npz.files else raw_npz['behavior']
+    data_param = raw_npz
 
     print('Data is loaded but not shuffled yet!\n')
 
@@ -259,7 +261,7 @@ def import_dataset(ctg_condition, dataset_to_use, dataset_version = 'v05', max_s
             data_param = {
                 'time_discr' : data_param['dtime'],
                 'time_sec' : data_param['time'],
-                'behavior' : data_param['behavior'], # behavior for full dataset
+                'behavior' : behavior_arr,
                 'command_id' : data_param['command_id']
             }
         elif dataset_to_use == 'cvx':
@@ -271,7 +273,7 @@ def import_dataset(ctg_condition, dataset_to_use, dataset_version = 'v05', max_s
             data_param = {
                 'time_discr' : data_param['dtime'],
                 'time_sec' : data_param['time'],
-                'behavior' : data_param['behavior'], # behavior for full dataset
+                'behavior' : behavior_arr,
                 'command_id' : data_param['command_id']
             }
         else: # default condition
@@ -286,10 +288,11 @@ def import_dataset(ctg_condition, dataset_to_use, dataset_version = 'v05', max_s
             torch_ctgs = torch.concatenate((ctgs_scp, ctgs_cvx), axis=0)[perm]
             goal_timeseq = torch.tensor(np.repeat(data_param['target_state'][:,None,:], torch_states.shape[1], axis=1))
             torch_goal = torch.concatenate((goal_timeseq, goal_timeseq), axis=0)[perm]
+            behavior_concat = np.concatenate((behavior_arr, behavior_arr), axis=0)[perm]
             data_param = {
                 'time_discr' : np.concatenate((data_param['dtime'], data_param['dtime']), axis=0)[perm],
                 'time_sec' : np.concatenate((data_param['time'], data_param['time']), axis=0)[perm],
-                'behavior' : np.concatenate((data_param['behavior'], data_param['behavior']), axis=0)[perm],
+                'behavior' : behavior_concat,
                 'command_id' : np.concatenate((data_param['command_id'], data_param['command_id']), axis=0)[perm]
             }
             print("Data shuffled and combined from both SCP and CVX datasets.\n")
@@ -302,7 +305,7 @@ def import_dataset(ctg_condition, dataset_to_use, dataset_version = 'v05', max_s
         data_param = {
             'time_discr' : data_param['dtime'],
             'time_sec' : data_param['time'],
-            'behavior' : data_param['behavior'], # behavior for full dataset
+            'behavior' : behavior_arr,
             'command_id' : data_param['command_id']
         }
 
@@ -439,7 +442,6 @@ def torch_model_inference_dyn(model, test_loader, data_sample, text_encoder, com
                     states=states_dyn[:,:t+1,:],
                     actions=actions_dyn[:,:t+1,:],
                     constraints=ctgs_dyn[:,:t+1,:],
-                    goal=goal_i[:,:t+1,:],
                     commands_emb=commands_emb_i,
                     timesteps=timesteps_i[:,:t+1],
                     attention_mask=attention_mask_i[:,:t+1],
